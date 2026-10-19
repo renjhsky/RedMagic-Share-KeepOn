@@ -43,6 +43,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile String failure = "";
     private static volatile long onSince;
     private static volatile boolean enabled = true;
+    private static volatile int timeoutMinutes = TimeoutPolicy.DEFAULT_MINUTES;
+    private static boolean configurationLoaded;
     private static ClassLoader targetLoader;
     private static final Map<TextView, CharSequence> originalSummaries = new WeakHashMap<>();
 
@@ -84,40 +86,57 @@ public final class HookEntry implements IXposedHookLoadPackage {
         Class<?> status = XposedHelpers.findClass(ModuleInfo.STATUS_CLASS, loader);
         Class<?> runner = XposedHelpers.findClass(ModuleInfo.CALLBACK_CLASS, loader);
         Method arm = status.getDeclaredMethod("F", boolean.class);
-        Method restore = status.getDeclaredMethod("z", Context.class);
+        Method restore = status.getDeclaredMethod("n", Context.class);
+        Method storedStart = status.getDeclaredMethod("z", Context.class);
         Method run = runner.getDeclaredMethod("run");
-        if (arm.getReturnType() != void.class || restore.getReturnType() != long.class
+        if (arm.getReturnType() != void.class || restore.getReturnType() != void.class
+                || storedStart.getReturnType() != long.class
                 || run.getReturnType() != void.class || !Runnable.class.isAssignableFrom(runner)
-                || runner.getDeclaredField("a").getType() != status) {
+                || runner.getDeclaredField("a").getType() != status
+                || !Runnable.class.isAssignableFrom(status.getDeclaredField("w").getType())
+                || !Handler.class.isAssignableFrom(status.getDeclaredField("z").getType())) {
             throw new IllegalStateException("target signatures changed");
         }
+        status.getDeclaredMethod("b0", Runnable.class, long.class);
+        status.getDeclaredMethod("e0", Runnable.class);
+        status.getDeclaredMethod("c0", Context.class, long.class);
+        status.getDeclaredMethod("r");
         List<XC_MethodHook.Unhook> installed = new ArrayList<>();
         try {
             installed.add(XposedBridge.hookMethod(arm, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!enabled) return;
-                    if (Boolean.TRUE.equals(param.args[0])) {
+                    if (enabled && timeoutMinutes == 0 && Boolean.TRUE.equals(param.args[0])) {
                         arms.incrementAndGet();
                         // F controls the timer ONLY. Its false branch cancels the dedicated
                         // runnable and clears the saved start time; it never changes the switch.
                         param.args[0] = false;
                     }
                 }
+                @Override protected void afterHookedMethod(MethodHookParam param) {
+                    if (!enabled || timeoutMinutes == 0 || param.hasThrowable()
+                            || !Boolean.TRUE.equals(param.args[0])) return;
+                    // Run stock F(true) first, retaining its initialization runnable and
+                    // persisted start timestamp. Replace only its dedicated timeout task.
+                    try {
+                        Context context = (Context) XposedHelpers.callMethod(param.thisObject, "r");
+                        if (context != null && ((Long) XposedHelpers.callMethod(param.thisObject, "z", context)) > 0L)
+                            scheduleTimer(param.thisObject, TimeoutPolicy.millis(timeoutMinutes));
+                    } catch (Throwable e) { log("设置关闭时间失败：" + e.getClass().getSimpleName()); }
+                }
             }));
             installed.add(XposedBridge.hookMethod(restore, new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam param) {
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
                     if (!enabled) return;
-                    if (!param.hasThrowable() && param.getResult() instanceof Long) {
-                        if ((Long) param.getResult() > 0L) restores.incrementAndGet();
-                        // z(Context) reads only time_switch_timeout. Returning zero prevents
-                        // n(Context) from rearming an old timer after a process restart.
-                        param.setResult(0L);
-                    }
+                    try {
+                        // n is exclusively timer restoration. Its stock arithmetic clamps
+                        // to 600000 ms, so adjust restoration as well as fresh scheduling.
+                        if (restoreTimer(param.thisObject, (Context) param.args[0])) param.setResult(null);
+                    } catch (Throwable e) { log("恢复关闭时间失败：" + e.getClass().getSimpleName()); }
                 }
             }));
             installed.add(XposedBridge.hookMethod(run, new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    if (!enabled) return;
+                    if (!enabled || timeoutMinutes != 0) return;
                     callbacks.incrementAndGet();
                     // This exact runnable has one job: call the idle auto-close routine p().
                     // Manual close and transfer-completion cleanup do not call this runnable.
@@ -143,7 +162,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         if (v instanceof TextView) {
                             TextView text = (TextView) v;
                             if (!originalSummaries.containsKey(text)) originalSummaries.put(text, text.getText());
-                            text.setText(enabled ? "开启后可被附近的设备发现，将保持开启直至手动关闭" : originalSummaries.get(text));
+                            text.setText(enabled ? TimeoutPolicy.summary(timeoutMinutes) : originalSummaries.get(text));
                         }
                     }
                 });
@@ -175,6 +194,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     }
                     Bundle b = new Bundle();
                     b.putString("module", ModuleInfo.VERSION);
+                    b.putInt("versionCode", ModuleInfo.VERSION_CODE);
+                    b.putInt("timeout_minutes", timeoutMinutes);
                     b.putString("target", targetVersion(context));
                     b.putString("fingerprint", fingerprint);
                     b.putString("failure", failure);
@@ -221,10 +242,19 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void refreshConfig(Context context, boolean force) {
-        boolean desired = ModuleConfig.readFromModule(context);
-        boolean changed = enabled != desired;
-        enabled = desired;
-        if (coreHooks == 3 && (changed || force) && shareState(context) == 1) {
+        ModuleConfig.State desired = ModuleConfig.readStateFromModule(context);
+        boolean initial = !configurationLoaded;
+        boolean changed = enabled != desired.enabled || timeoutMinutes != desired.timeoutMinutes;
+        enabled = desired.enabled;
+        timeoutMinutes = desired.timeoutMinutes;
+        configurationLoaded = true;
+        for (Map.Entry<TextView, CharSequence> entry : originalSummaries.entrySet()) {
+            TextView view = entry.getKey();
+            if (view != null) view.setText(enabled ? TimeoutPolicy.summary(timeoutMinutes) : entry.getValue());
+        }
+        // First configuration read precedes vendor initialization. Let n(Context)
+        // restore the saved remaining time; do not restart it on every process load.
+        if (coreHooks == 3 && ((!initial && changed) || force) && shareState(context) == 1) {
             try {
                 Object status = XposedHelpers.callStaticMethod(
                         XposedHelpers.findClass(ModuleInfo.STATUS_CLASS, targetLoader), "v");
@@ -235,7 +265,30 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void applyTimerPolicy(Object status, boolean shareOn) {
-        if (shareOn) XposedHelpers.callMethod(status, "F", !enabled);
+        if (shareOn) XposedHelpers.callMethod(status, "F", !enabled || timeoutMinutes != 0);
+    }
+
+    private static boolean restoreTimer(Object status, Context context) {
+        long startedAt = (Long) XposedHelpers.callMethod(status, "z", context);
+        if (startedAt <= 0L) return true;
+        restores.incrementAndGet();
+        if (XposedHelpers.getObjectField(status, "z") == null
+                || XposedHelpers.callMethod(status, "r") == null) XposedHelpers.callMethod(status, "G", context);
+        long remaining = TimeoutPolicy.remainingMillis(timeoutMinutes, startedAt, System.currentTimeMillis());
+        if (timeoutMinutes == 0) {
+            Object task = XposedHelpers.getObjectField(status, "w");
+            XposedHelpers.callMethod(status, "e0", task);
+        } else scheduleTimer(status, remaining);
+        if (timeoutMinutes == 0 || remaining == 0L) XposedHelpers.callMethod(status, "c0", context, 0L);
+        return true;
+    }
+
+    private static void scheduleTimer(Object status, long delay) {
+        Object task = XposedHelpers.getObjectField(status, "w");
+        if (!(task instanceof Runnable) || XposedHelpers.getObjectField(status, "z") == null)
+            throw new IllegalStateException("vendor timer unavailable");
+        XposedHelpers.callMethod(status, "e0", task);
+        XposedHelpers.callMethod(status, "b0", task, delay);
     }
 
     private static void setShare(Context context, boolean desired) {

@@ -51,6 +51,14 @@ def main():
     assert restore_callers == [TARGET + "->n(Landroid/content/Context;)V"]
     n = code(method(TARGET, "n", "(Landroid/content/Context;)V"))
     assert "->z(Landroid/content/Context;)J" in n and "600000" in n and "->b0" in n
+    assert "->currentTimeMillis()J" in arm and "->currentTimeMillis()J" in n
+    assert "->w Ljava/lang/Runnable;" in arm and "->w Ljava/lang/Runnable;" in n
+    scheduler = code(method(TARGET, "b0", "(Ljava/lang/Runnable; J)V"))
+    cancel = code(method(TARGET, "e0", "(Ljava/lang/Runnable;)V"))
+    assert "->postDelayed(Ljava/lang/Runnable; J)Z" in scheduler
+    assert "->removeCallbacks(Ljava/lang/Runnable;)V" in cancel
+    constructors = [code(m) for m in classes[TARGET].get_methods() if m.get_name() == "<init>"]
+    assert any(RUNNER in body and "->w Ljava/lang/Runnable;" in body for body in constructors)
     p_callers = callers(TARGET, "p", "()V")
     assert p_callers == [TARGET + "->h(Lcom/zte/cn/zteshare/ZteShareStatus;)V"]
     run_code = code(method(RUNNER, "run", "()V"))
@@ -76,11 +84,13 @@ def main():
     hooks = (Path(__file__).parent / "src/io/github/redmagic/sharekeepon/HookEntry.java").read_text()
     assert 'getDeclaredMethod("F", boolean.class)' in hooks
     assert 'getDeclaredMethod("z", Context.class)' in hooks
+    assert 'getDeclaredMethod("n", Context.class)' in hooks
     assert 'getDeclaredMethod("run")' in hooks
     assert 'getDeclaredMethod("q"' not in hooks and 'getDeclaredMethod("t0"' not in hooks
     report = {"package": apk.get_package(), "version": apk.get_androidversion_name(),
               "dex_sha256": EXPECTED, "timer_ms": 600000,
               "stored_timer_read_callers": restore_callers,
+              "wall_clock_start_and_dedicated_callback_verified": True,
               "auto_close_callers": p_callers,
               "manual_switch_entries": list(entries),
               "manual_deferred_close_preserved": True,

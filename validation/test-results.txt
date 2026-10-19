@@ -1,0 +1,9 @@
+RedMagic Share Keep On 1.1
+
+PASS: 81 host-JVM hook and timer assertions.
+PASS: 8 Robolectric 4.14.1 / Android API 35 activity tests.
+PASS: original target DEX audit.
+PASS: APK v3 signature and ZIP alignment.
+PASS: same signing identity as 1.0; versionCode 110.
+
+No connected NX789J device; injection, IPC, screen-off timing and radio/file transfer behavior still require device verification.

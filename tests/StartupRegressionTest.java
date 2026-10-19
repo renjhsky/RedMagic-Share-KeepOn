@@ -1,14 +1,14 @@
-import android.app.Application;
 import android.content.Intent;
 import android.content.ContentValues;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.Looper;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Switch;
 import android.widget.TextView;
-import android.widget.Toolbar;
+import android.widget.Button;
+import android.widget.Spinner;
+import android.widget.ScrollView;
 import io.github.redmagic.sharekeepon.MainActivity;
 import io.github.redmagic.sharekeepon.ModuleConfig;
 import io.github.redmagic.sharekeepon.ModuleConfigProvider;
@@ -73,13 +73,20 @@ public class StartupRegressionTest {
     }
     @Test public void updateEntryOpensLatestRelease() {
         ActivityController<MainActivity> c=Robolectric.buildActivity(MainActivity.class).setup();
-        Toolbar bar=find(c.get().getWindow().getDecorView(),Toolbar.class).get(0);
-        assertEquals(1,bar.getMenu().size());
-        assertEquals("检查更新",bar.getMenu().getItem(0).getTitle().toString());
-        assertTrue(bar.getMenu().performIdentifierAction(bar.getMenu().getItem(0).getItemId(),0));
+        View root=c.get().getWindow().getDecorView();
+        assertTrue(contains(root,"版本与更新"));
+        Button update=null,project=null;
+        for(Button button:find(root,Button.class)) {
+            if("查看更新（GitHub）".equals(button.getText().toString())) update=button;
+            if("项目主页".equals(button.getText().toString())) project=button;
+        }
+        assertNotNull(update); assertNotNull(project); update.performClick();
         Intent intent=Shadows.shadowOf(c.get()).getNextStartedActivity();
         assertNotNull(intent); assertEquals(Intent.ACTION_VIEW,intent.getAction());
         assertEquals(ModuleInfo.UPDATE_URL,intent.getDataString());
+        assertTrue(intent.hasCategory(Intent.CATEGORY_BROWSABLE));
+        project.performClick();intent=Shadows.shadowOf(c.get()).getNextStartedActivity();
+        assertEquals(ModuleInfo.PROJECT_URL,intent.getDataString());
         c.pause().stop().destroy();
     }
     @Test public void remoteConfigurationIsReadOnly() {
@@ -87,6 +94,8 @@ public class StartupRegressionTest {
         assertTrue(provider.call("get",null,null).getBoolean("enabled"));
         assertTrue(ModuleConfig.setEnabled(RuntimeEnvironment.getApplication(),false));
         assertFalse(provider.call("get",null,null).getBoolean("enabled"));
+        assertTrue(ModuleConfig.setTimeoutMinutes(RuntimeEnvironment.getApplication(),30));
+        assertEquals(30,provider.call("get",null,null).getInt("timeout_minutes"));
         try {provider.call("set",null,new Bundle());fail("remote write allowed");} catch(SecurityException expected) {}
         try {provider.update(ModuleConfig.URI,new ContentValues(),null,null);fail("update allowed");} catch(SecurityException expected) {}
         try {provider.insert(ModuleConfig.URI,new ContentValues());fail("insert allowed");} catch(SecurityException expected) {}
@@ -101,5 +110,36 @@ public class StartupRegressionTest {
         Shadows.shadowOf(Looper.getMainLooper()).idleFor(5,TimeUnit.SECONDS);
         assertFalse(share.isChecked());assertFalse(share.isEnabled());
         c.pause().stop().destroy();
+    }
+    @Test public void sixPresetsPersistAfterRestart() {
+        ActivityController<MainActivity> c=Robolectric.buildActivity(MainActivity.class).setup();
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(5,TimeUnit.SECONDS);
+        Spinner picker=find(c.get().getWindow().getDecorView(),Spinner.class).get(0);
+        assertEquals(6,picker.getCount()); assertEquals("常开",picker.getSelectedItem());
+        int[] minutes={1,5,10,30,60,0};String[] labels={"1分钟","5分钟","10分钟","30分钟","60分钟","常开"};
+        for(int i=0;i<minutes.length;i++) {
+            assertEquals(labels[i],picker.getItemAtPosition(i));picker.setSelection(i);
+            Shadows.shadowOf(Looper.getMainLooper()).idleFor(5,TimeUnit.SECONDS);
+            assertEquals(minutes[i],ModuleConfig.timeoutMinutes(c.get()));
+        }
+        picker.setSelection(4);Shadows.shadowOf(Looper.getMainLooper()).idleFor(5,TimeUnit.SECONDS);
+        c.pause().stop().destroy();
+        c=Robolectric.buildActivity(MainActivity.class).setup();
+        Shadows.shadowOf(Looper.getMainLooper()).idleFor(5,TimeUnit.SECONDS);
+        assertEquals("60分钟",find(c.get().getWindow().getDecorView(),Spinner.class).get(0).getSelectedItem());
+        c.pause().stop().destroy();
+    }
+    @Test public void invalidTimeoutCannotOverwriteSavedPreset() {
+        assertTrue(ModuleConfig.setTimeoutMinutes(RuntimeEnvironment.getApplication(),5));
+        assertFalse(ModuleConfig.setTimeoutMinutes(RuntimeEnvironment.getApplication(),2));
+        assertFalse(ModuleConfig.setTimeoutMinutes(RuntimeEnvironment.getApplication(),-1));
+        assertEquals(5,ModuleConfig.timeoutMinutes(RuntimeEnvironment.getApplication()));
+    }
+    @Test @Config(qualifiers="zh-rCN-w640dp-h320dp-land") public void landscapeCanScrollToUpdates() {
+        ActivityController<MainActivity> c=Robolectric.buildActivity(MainActivity.class).setup();
+        View root=c.get().getWindow().getDecorView();
+        assertEquals(1,find(root,ScrollView.class).size());
+        assertEquals(2,find(root,Switch.class).size());assertEquals(1,find(root,Spinner.class).size());
+        assertTrue(contains(root,"查看更新（GitHub）"));c.pause().stop().destroy();
     }
 }

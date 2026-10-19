@@ -1,0 +1,20 @@
+{
+  "package": "com.zte.cn.zteshare",
+  "version": "16.0.000.000.2607131724",
+  "dex_sha256": "a65f3ebc49931f25e3d04da3e3c94743f996384b341db0a93bc02e45a8b1d840",
+  "timer_ms": 600000,
+  "stored_timer_read_callers": [
+    "Lcom/zte/cn/zteshare/ZteShareStatus;->n(Landroid/content/Context;)V"
+  ],
+  "wall_clock_start_and_dedicated_callback_verified": true,
+  "auto_close_callers": [
+    "Lcom/zte/cn/zteshare/ZteShareStatus;->h(Lcom/zte/cn/zteshare/ZteShareStatus;)V"
+  ],
+  "manual_switch_entries": [
+    "settings",
+    "tile",
+    "tools"
+  ],
+  "manual_deferred_close_preserved": true,
+  "result": "PASS: static DEX audit; device behavior still requires testing"
+}

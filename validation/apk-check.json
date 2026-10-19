@@ -1,0 +1,13 @@
+{
+  "version": "1.1",
+  "versionCode": 110,
+  "apk_sha256": "274d86b972b44f2a2fd95dc1382a357659ad3cd73e8cde130e948ae9b8081e65",
+  "certificate_sha256": "bf115fcf24f6365717149ba614f40967928077f07a16f4e3c11dde69dbd99a8d",
+  "same_signing_identity_as_previous": true,
+  "xposed_api_packaged": false,
+  "extra_permissions": [
+    "com.zte.cn.zteshare.permission.BIND_ZTESHARE_SERVICE",
+    "io.github.redmagic.sharekeepon.permission.CONTROL"
+  ],
+  "device_tested": false
+}

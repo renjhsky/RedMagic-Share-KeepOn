@@ -6,12 +6,15 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 
-/** Only a non-sensitive enabled bit is exposed; all remote writes are rejected. */
+/** Only module state and the timeout preset are exposed; remote writes are rejected. */
 public final class ModuleConfigProvider extends ContentProvider {
     @Override public boolean onCreate() { return true; }
     @Override public Bundle call(String method, String arg, Bundle extras) {
         if (!"get".equals(method)) throw new SecurityException("Read-only configuration");
-        Bundle result = new Bundle(); result.putBoolean("enabled", ModuleConfig.enabled(getContext())); return result;
+        Bundle result = new Bundle();
+        result.putBoolean("enabled", ModuleConfig.enabled(getContext()));
+        result.putInt("timeout_minutes", ModuleConfig.timeoutMinutes(getContext()));
+        return result;
     }
     @Override public String getType(Uri uri) { return "vnd.android.cursor.item/vnd.sharekeepon.config"; }
     @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }

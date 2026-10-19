@@ -1,218 +1,343 @@
 #!/usr/bin/env python3
-"""Exercise the real HookEntry against an in-memory Xposed test double, on a host JVM.
-
-This verifies hook arguments, callback suppression, rollback, and fingerprint gating.
-It is not a substitute for Android/LSPosed execution or the 15-minute phone test.
-"""
+"""Verify actual hooks using a host Xposed double and audited vendor timer contract."""
 import argparse
 from pathlib import Path
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
-SOURCES = {
-"android/app/Application.java": """package android.app;
-public class Application { private void attach(android.content.Context c) {} }
-""",
-"android/content/pm/ApplicationInfo.java": """package android.content.pm;
-public class ApplicationInfo { public String sourceDir; }
-""",
-"de/robv/android/xposed/IXposedHookLoadPackage.java": """package de.robv.android.xposed;
-public interface IXposedHookLoadPackage {
- void handleLoadPackage(de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam p) throws Throwable;
-}
-""",
-"de/robv/android/xposed/callbacks/XC_LoadPackage.java": """package de.robv.android.xposed.callbacks;
-public class XC_LoadPackage {
- public static class LoadPackageParam {
-  public String packageName, processName; public boolean isFirstApplication;
-  public ClassLoader classLoader; public android.content.pm.ApplicationInfo appInfo;
- }
-}
-""",
-"de/robv/android/xposed/XC_MethodHook.java": """package de.robv.android.xposed;
-import java.lang.reflect.Member;
-public class XC_MethodHook {
- protected void beforeHookedMethod(MethodHookParam p) throws Throwable {}
- protected void afterHookedMethod(MethodHookParam p) throws Throwable {}
- public static final class MethodHookParam {
-  public Object[] args; public Object thisObject; public boolean returnEarly;
-  private Object result; private Throwable throwable;
-  public Object getResult() { return result; }
-  public void setResult(Object r) { result=r; throwable=null; returnEarly=true; }
-  public boolean hasThrowable() { return throwable!=null; }
-  public Throwable getThrowable() { return throwable; }
-  public void setThrowable(Throwable t) { throwable=t; returnEarly=true; }
- }
- public class Unhook {
-  private final Member method;
-  public Unhook(Member m) { method=m; }
-  public void unhook() { XposedBridge.hooks.remove(method); }
- }
-}
-""",
-"de/robv/android/xposed/XposedBridge.java": """package de.robv.android.xposed;
-import java.lang.reflect.Member;
-import java.util.LinkedHashMap;
-public class XposedBridge {
- public static final LinkedHashMap<Member,XC_MethodHook> hooks=new LinkedHashMap<>();
- public static int attempts, failAt;
- public static XC_MethodHook.Unhook hookMethod(Member m, XC_MethodHook h) {
-  attempts++; if (failAt!=0 && attempts==failAt) throw new IllegalStateException("test failure");
-  hooks.put(m,h); return h.new Unhook(m);
- }
- public static void log(String s) {}
-}
-""",
-"de/robv/android/xposed/XposedHelpers.java": """package de.robv.android.xposed;
-import java.lang.reflect.Method;
-public class XposedHelpers {
- public static Object callMethod(Object object, String name, Object... args) {
-  try {
-   for(Method m:object.getClass().getDeclaredMethods()) if(m.getName().equals(name) && m.getParameterCount()==args.length) {
-    m.setAccessible(true); return m.invoke(object,args);
-   }
-   throw new NoSuchMethodException(name);
-  } catch(Exception e) { throw new RuntimeException(e); }
- }
- public static Object callStaticMethod(Class<?> type, String name, Object... args) {
-  try {
-   for(Method m:type.getDeclaredMethods()) if(m.getName().equals(name) && m.getParameterCount()==args.length) {
-    m.setAccessible(true); return m.invoke(null,args);
-   }
-   throw new NoSuchMethodException(name);
-  } catch(Exception e) { throw new RuntimeException(e); }
- }
- public static Class<?> findClass(String n, ClassLoader l) {
-  try { return Class.forName(n,false,l); } catch(Exception e) { throw new RuntimeException(e); }
- }
- public static XC_MethodHook.Unhook findAndHookMethod(String c, ClassLoader l, String n, Object... v) {
-  return findAndHookMethod(findClass(c,l),n,v);
- }
- public static XC_MethodHook.Unhook findAndHookMethod(Class<?> c, String n, Object... v) {
-  try {
-   Class<?>[] args=new Class<?>[v.length-1];
-   for(int i=0;i<args.length;i++) args[i]=(Class<?>)v[i];
-   Method m=c.getDeclaredMethod(n,args);
-   return XposedBridge.hookMethod(m,(XC_MethodHook)v[v.length-1]);
-  } catch(Exception e) { throw new RuntimeException(e); }
- }
-}
-""",
-"com/zte/cn/zteshare/ZteShareStatus.java": """package com.zte.cn.zteshare;
-// Signature-only fixture. Original behavior is audited separately from the user's APK.
-public class ZteShareStatus {
- public int timerArms, timerCancels;
- public void F(boolean v) {if(v)timerArms++;else timerCancels++;} public long z(android.content.Context c) {return 0;}
- public void q() {} public void t0(boolean v) {}
- public class b implements Runnable { public final ZteShareStatus a=ZteShareStatus.this; public void run(){} }
-}
-""",
-"com/zte/cn/zteshare/activity/SettingsActivity.java": """package com.zte.cn.zteshare.activity;
-public class SettingsActivity { public void onResume(){} }
-""",
-"de/robv/android/xposed/Harness.java": r"""package de.robv.android.xposed;
-import io.github.redmagic.sharekeepon.*;
-import java.lang.reflect.*;
-import java.nio.file.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.zip.*;
-import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
-public class Harness {
- static int checks;
- static void check(boolean ok,String what) { if(!ok) throw new AssertionError(what); checks++; }
- static Object value(String n) throws Exception { Field f=HookEntry.class.getDeclaredField(n); f.setAccessible(true); return f.get(null); }
- static void reset() throws Exception {
-  for(String n:new String[]{"entered","summaryHook","receiverReady"}) {
-   Field f=HookEntry.class.getDeclaredField(n); f.setAccessible(true); f.setBoolean(null,false);
-  }
-  for(String n:new String[]{"fingerprint","failure"}) {
-   Field f=HookEntry.class.getDeclaredField(n); f.setAccessible(true); f.set(null,"");
-  }
-  Field f=HookEntry.class.getDeclaredField("coreHooks");f.setAccessible(true);f.setInt(null,0);
-  Field enabled=HookEntry.class.getDeclaredField("enabled");enabled.setAccessible(true);enabled.setBoolean(null,true);
-  for(String n:new String[]{"arms","restores","callbacks"}) ((AtomicInteger)value(n)).set(0);
-  XposedBridge.hooks.clear();XposedBridge.attempts=0;XposedBridge.failAt=0;
- }
- static LoadPackageParam param(String apk) {
-  LoadPackageParam p=new LoadPackageParam();p.packageName=ModuleInfo.TARGET;p.processName=ModuleInfo.TARGET;
-  p.isFirstApplication=true;p.classLoader=Harness.class.getClassLoader();
-  p.appInfo=new android.content.pm.ApplicationInfo();p.appInfo.sourceDir=apk;return p;
- }
- public static void main(String[] args) throws Throwable {
-  HookEntry entry=new HookEntry();
-  LoadPackageParam p=param(args[0]); p.packageName="com.android.systemui";entry.handleLoadPackage(p);
-  check(XposedBridge.hooks.isEmpty(),"unrelated package untouched");
-  p=param(args[0]);p.processName=ModuleInfo.TARGET+":other";entry.handleLoadPackage(p);
-  check(XposedBridge.hooks.isEmpty(),"unrelated process untouched");
-  p=param(args[0]);p.isFirstApplication=false;entry.handleLoadPackage(p);
-  check(XposedBridge.hooks.isEmpty(),"secondary package load untouched");
-  Path tampered=Files.createTempFile("changed-target-",".apk");
-  try(ZipOutputStream z=new ZipOutputStream(Files.newOutputStream(tampered))) {
-   z.putNextEntry(new ZipEntry("classes.dex"));z.write(new byte[]{1,2,3});z.closeEntry();
-  }
-  reset();entry.handleLoadPackage(param(tampered.toString()));
-  check((Integer)value("coreHooks")==0,"changed DEX cannot install core hooks");
-  check(!((String)value("failure")).isEmpty(),"changed DEX reports reason");
-  check(XposedBridge.hooks.size()==1,"changed DEX installs diagnostic attach only");
-  Files.delete(tampered);
-  reset();entry.handleLoadPackage(param(args[0]));
-  check((Integer)value("coreHooks")==3,"matching DEX installs all core hooks");
-  check(XposedBridge.hooks.size()==5,"only three core hooks, settings summary and diagnostic attach");
-  check((Boolean)value("summaryHook"),"summary hook installed");
-  Class<?> status=Class.forName(ModuleInfo.STATUS_CLASS);
-  Method arm=status.getDeclaredMethod("F",boolean.class);
-  XC_MethodHook.MethodHookParam hp=new XC_MethodHook.MethodHookParam();hp.args=new Object[]{true};
-  XposedBridge.hooks.get(arm).beforeHookedMethod(hp);
-  check(Boolean.FALSE.equals(hp.args[0]),"arming converted to original cancellation branch");
-  check(!hp.returnEarly,"original cancellation method still executes");
-  check(((AtomicInteger)value("arms")).get()==1,"arming diagnostic incremented");
-  hp=new XC_MethodHook.MethodHookParam();hp.args=new Object[]{false};
-  XposedBridge.hooks.get(arm).beforeHookedMethod(hp);
-  check(Boolean.FALSE.equals(hp.args[0]) && !hp.returnEarly,"manual off cancellation unchanged");
-  check(((AtomicInteger)value("arms")).get()==1,"manual off not counted as arming");
-  Method restore=status.getDeclaredMethod("z",android.content.Context.class);
-  hp=new XC_MethodHook.MethodHookParam();hp.setResult(123L);
-  XposedBridge.hooks.get(restore).afterHookedMethod(hp);
-  check(Long.valueOf(0).equals(hp.getResult()),"persisted timer start suppressed");
-  check(((AtomicInteger)value("restores")).get()==1,"old timer read counted");
-  hp=new XC_MethodHook.MethodHookParam();Throwable error=new IllegalStateException("original");hp.setThrowable(error);
-  XposedBridge.hooks.get(restore).afterHookedMethod(hp);
-  check(hp.getThrowable()==error,"original preference error not concealed");
-  Method callback=Class.forName(ModuleInfo.CALLBACK_CLASS).getDeclaredMethod("run");
-  hp=new XC_MethodHook.MethodHookParam();XposedBridge.hooks.get(callback).beforeHookedMethod(hp);
-  check(hp.returnEarly && hp.getResult()==null,"dedicated expiry callback prevented");
-  check(!XposedBridge.hooks.containsKey(status.getDeclaredMethod("q")),"manual deferred cleanup not hooked");
-  check(!XposedBridge.hooks.containsKey(status.getDeclaredMethod("t0",boolean.class)),"manual wait flag not hooked");
-  Field enabled=HookEntry.class.getDeclaredField("enabled");enabled.setAccessible(true);enabled.setBoolean(null,false);
-  hp=new XC_MethodHook.MethodHookParam();hp.args=new Object[]{true};
-  XposedBridge.hooks.get(arm).beforeHookedMethod(hp);
-  check(Boolean.TRUE.equals(hp.args[0]) && !hp.returnEarly,"disabled module allows original timer scheduling");
-  hp=new XC_MethodHook.MethodHookParam();hp.setResult(123L);
-  XposedBridge.hooks.get(restore).afterHookedMethod(hp);
-  check(Long.valueOf(123L).equals(hp.getResult()),"disabled module allows old timer restore");
-  hp=new XC_MethodHook.MethodHookParam();XposedBridge.hooks.get(callback).beforeHookedMethod(hp);
-  check(!hp.returnEarly,"disabled module allows expiry callback");
-  Object object=status.newInstance();
-  Method policy=HookEntry.class.getDeclaredMethod("applyTimerPolicy",Object.class,boolean.class);policy.setAccessible(true);
-  policy.invoke(null,object,true);
-  check(status.getField("timerArms").getInt(object)==1,"turning module off rearms original timer while share is on");
-  enabled.setBoolean(null,true);policy.invoke(null,object,true);
-  check(status.getField("timerCancels").getInt(object)==1,"turning module on cancels existing timer");
-  policy.invoke(null,object,false);
-  check(status.getField("timerArms").getInt(object)==1 && status.getField("timerCancels").getInt(object)==1,"policy does not enable or time a disabled share switch");
-  int before=XposedBridge.hooks.size();entry.handleLoadPackage(param(args[0]));
-  check(XposedBridge.hooks.size()==before,"duplicate load does not duplicate hooks");
-  reset();XposedBridge.failAt=3;
-  Method install=HookEntry.class.getDeclaredMethod("installCore",ClassLoader.class);install.setAccessible(true);
-  boolean failed=false;
-  try { install.invoke(null,Harness.class.getClassLoader()); } catch(InvocationTargetException e) {failed=true;}
-  check(failed && XposedBridge.hooks.isEmpty() && (Integer)value("coreHooks")==0,"partial install rolled back");
-  System.out.println("PASS: "+checks+" host-JVM hook assertions (not an Android device test)");
- }
-}
-""",
-}
+SOURCES = {'android/app/Application.java': 'package android.app;\n'
+                                 'public class Application { private void attach(android.content.Context c) '
+                                 '{} }\n',
+ 'android/content/pm/ApplicationInfo.java': 'package android.content.pm;\n'
+                                            'public class ApplicationInfo { public String sourceDir; }\n',
+ 'de/robv/android/xposed/IXposedHookLoadPackage.java': 'package de.robv.android.xposed;\n'
+                                                       'public interface IXposedHookLoadPackage {\n'
+                                                       ' void '
+                                                       'handleLoadPackage(de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam '
+                                                       'p) throws Throwable;\n'
+                                                       '}\n',
+ 'de/robv/android/xposed/callbacks/XC_LoadPackage.java': 'package de.robv.android.xposed.callbacks;\n'
+                                                         'public class XC_LoadPackage {\n'
+                                                         ' public static class LoadPackageParam {\n'
+                                                         '  public String packageName, processName; public '
+                                                         'boolean isFirstApplication;\n'
+                                                         '  public ClassLoader classLoader; public '
+                                                         'android.content.pm.ApplicationInfo appInfo;\n'
+                                                         ' }\n'
+                                                         '}\n',
+ 'de/robv/android/xposed/XC_MethodHook.java': 'package de.robv.android.xposed;\n'
+                                              'import java.lang.reflect.Member;\n'
+                                              'public class XC_MethodHook {\n'
+                                              ' protected void beforeHookedMethod(MethodHookParam p) throws '
+                                              'Throwable {}\n'
+                                              ' protected void afterHookedMethod(MethodHookParam p) throws '
+                                              'Throwable {}\n'
+                                              ' public static final class MethodHookParam {\n'
+                                              '  public Object[] args; public Object thisObject; public '
+                                              'boolean returnEarly;\n'
+                                              '  private Object result; private Throwable throwable;\n'
+                                              '  public Object getResult() { return result; }\n'
+                                              '  public void setResult(Object r) { result=r; throwable=null; '
+                                              'returnEarly=true; }\n'
+                                              '  public boolean hasThrowable() { return throwable!=null; }\n'
+                                              '  public Throwable getThrowable() { return throwable; }\n'
+                                              '  public void setThrowable(Throwable t) { throwable=t; '
+                                              'returnEarly=true; }\n'
+                                              ' }\n'
+                                              ' public class Unhook {\n'
+                                              '  private final Member method;\n'
+                                              '  public Unhook(Member m) { method=m; }\n'
+                                              '  public void unhook() { XposedBridge.hooks.remove(method); '
+                                              '}\n'
+                                              ' }\n'
+                                              '}\n',
+ 'de/robv/android/xposed/XposedBridge.java': 'package de.robv.android.xposed;\n'
+                                             'import java.lang.reflect.Member;\n'
+                                             'import java.util.LinkedHashMap;\n'
+                                             'public class XposedBridge {\n'
+                                             ' public static final LinkedHashMap<Member,XC_MethodHook> '
+                                             'hooks=new LinkedHashMap<>();\n'
+                                             ' public static int attempts, failAt;\n'
+                                             ' public static XC_MethodHook.Unhook hookMethod(Member m, '
+                                             'XC_MethodHook h) {\n'
+                                             '  attempts++; if (failAt!=0 && attempts==failAt) throw new '
+                                             'IllegalStateException("test failure");\n'
+                                             '  hooks.put(m,h); return h.new Unhook(m);\n'
+                                             ' }\n'
+                                             ' public static void log(String s) {}\n'
+                                             '}\n',
+ 'de/robv/android/xposed/XposedHelpers.java': 'package de.robv.android.xposed;\n'
+                                              'import java.lang.reflect.*;\n'
+                                              'public class XposedHelpers {\n'
+                                              ' public static Object getObjectField(Object o,String name){\n'
+                                              '  try{Field '
+                                              'f=o.getClass().getDeclaredField(name);f.setAccessible(true);return '
+                                              'f.get(o);}\n'
+                                              '  catch(Exception e){throw new RuntimeException(e);}\n'
+                                              ' }\n'
+                                              ' private static Object invoke(Object o,Method m,Object[] '
+                                              'args)throws Throwable{\n'
+                                              '  m.setAccessible(true);XC_MethodHook '
+                                              'h=XposedBridge.hooks.get(m);\n'
+                                              '  XC_MethodHook.MethodHookParam p=new '
+                                              'XC_MethodHook.MethodHookParam();p.thisObject=o;p.args=args;\n'
+                                              '  if(h!=null)h.beforeHookedMethod(p);\n'
+                                              '  '
+                                              'if(!p.returnEarly)try{p.setResult(m.invoke(o,p.args));}catch(InvocationTargetException '
+                                              'e){p.setThrowable(e.getCause());}\n'
+                                              '  if(h!=null)h.afterHookedMethod(p);\n'
+                                              '  if(p.hasThrowable())throw p.getThrowable();return '
+                                              'p.getResult();\n'
+                                              ' }\n'
+                                              ' public static Object callMethod(Object o,String n,Object... '
+                                              'args){\n'
+                                              '  try{for(Method '
+                                              'm:o.getClass().getDeclaredMethods())if(m.getName().equals(n)&&m.getParameterCount()==args.length)return '
+                                              'invoke(o,m,args);\n'
+                                              '   throw new NoSuchMethodException(n);\n'
+                                              '  }catch(Throwable e){throw new RuntimeException(e);}\n'
+                                              ' }\n'
+                                              ' public static Object callStaticMethod(Class<?> c,String '
+                                              'n,Object... args){\n'
+                                              '  try{for(Method '
+                                              'm:c.getDeclaredMethods())if(m.getName().equals(n)&&m.getParameterCount()==args.length)return '
+                                              'invoke(null,m,args);\n'
+                                              '   throw new NoSuchMethodException(n);\n'
+                                              '  }catch(Throwable e){throw new RuntimeException(e);}\n'
+                                              ' }\n'
+                                              ' public static Class<?> findClass(String n,ClassLoader '
+                                              'l){try{return Class.forName(n,false,l);}catch(Exception '
+                                              'e){throw new RuntimeException(e);}}\n'
+                                              ' public static XC_MethodHook.Unhook findAndHookMethod(String '
+                                              'c,ClassLoader l,String n,Object... args){return '
+                                              'findAndHookMethod(findClass(c,l),n,args);}\n'
+                                              ' public static XC_MethodHook.Unhook '
+                                              'findAndHookMethod(Class<?> c,String n,Object... args){\n'
+                                              '  try{Class<?>[] types=new Class<?>[args.length-1];for(int '
+                                              'i=0;i<types.length;i++)types[i]=(Class<?>)args[i];\n'
+                                              '   return '
+                                              'XposedBridge.hookMethod(c.getDeclaredMethod(n,types),(XC_MethodHook)args[args.length-1]);\n'
+                                              '  }catch(Exception e){throw new RuntimeException(e);}\n'
+                                              ' }\n'
+                                              '}\n',
+ 'com/zte/cn/zteshare/ZteShareStatus.java': 'package com.zte.cn.zteshare;\n'
+                                            '// Contract fixture only. verify_target.py audits the actual '
+                                            'vendor DEX separately.\n'
+                                            'public class ZteShareStatus {\n'
+                                            ' public int '
+                                            'timerArms,timerCancels,initializations,closeCalls;public long '
+                                            'stamp,delay=-1;\n'
+                                            ' public android.content.Context context=new '
+                                            'android.content.Context();\n'
+                                            ' public android.os.Handler z=new android.os.Handler();public '
+                                            'Runnable w=new b();\n'
+                                            ' public android.content.Context r(){return context;}\n'
+                                            ' public void G(android.content.Context c){context=c;}\n'
+                                            ' public void F(boolean '
+                                            'v){if(v){initializations++;e0(w);b0(w,600000L);c0(context,System.currentTimeMillis());}\n'
+                                            '  else{c0(context,0);e0(w);}}\n'
+                                            ' public long z(android.content.Context c){return stamp;}\n'
+                                            ' public void n(android.content.Context c){if(stamp>0){long '
+                                            'elapsed=Math.max(0,Math.min(600000L,System.currentTimeMillis()-stamp));\n'
+                                            '  e0(w);b0(w,600000L-elapsed);if(elapsed==600000L)c0(c,0);}}\n'
+                                            ' public void b0(Runnable task,long ms){timerArms++;delay=ms;}\n'
+                                            ' public void e0(Runnable task){timerCancels++;delay=-1;}\n'
+                                            ' public void c0(android.content.Context c,long '
+                                            'value){stamp=value;}\n'
+                                            ' public void q(){}public void t0(boolean v){}\n'
+                                            ' public class b implements Runnable{public final ZteShareStatus '
+                                            'a=ZteShareStatus.this;public void run(){closeCalls++;}}\n'
+                                            '}\n',
+ 'com/zte/cn/zteshare/activity/SettingsActivity.java': 'package com.zte.cn.zteshare.activity;\n'
+                                                       'public class SettingsActivity { public void '
+                                                       'onResume(){} }\n',
+ 'de/robv/android/xposed/Harness.java': 'package de.robv.android.xposed;\n'
+                                        'import io.github.redmagic.sharekeepon.*;\n'
+                                        'import com.zte.cn.zteshare.ZteShareStatus;\n'
+                                        'import java.lang.reflect.*;\n'
+                                        'import java.nio.file.*;\n'
+                                        'import java.util.zip.*;\n'
+                                        'import '
+                                        'de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;\n'
+                                        'public class Harness {\n'
+                                        ' static int checks;\n'
+                                        ' static void check(boolean ok,String message){if(!ok)throw new '
+                                        'AssertionError(message);checks++;}\n'
+                                        ' static Object value(String n)throws Exception{Field '
+                                        'f=HookEntry.class.getDeclaredField(n);f.setAccessible(true);return '
+                                        'f.get(null);}\n'
+                                        ' static void set(String n,Object value)throws Exception{Field '
+                                        'f=HookEntry.class.getDeclaredField(n);f.setAccessible(true);f.set(null,value);}\n'
+                                        ' static void reset()throws Exception{\n'
+                                        '  for(String n:new '
+                                        'String[]{"entered","summaryHook","receiverReady","configurationLoaded"})set(n,false);\n'
+                                        '  for(String n:new '
+                                        'String[]{"fingerprint","failure"})set(n,"");set("coreHooks",0);set("enabled",true);set("timeoutMinutes",0);\n'
+                                        '  '
+                                        'XposedBridge.hooks.clear();XposedBridge.attempts=0;XposedBridge.failAt=0;\n'
+                                        ' }\n'
+                                        ' static LoadPackageParam param(String apk){LoadPackageParam p=new '
+                                        'LoadPackageParam();p.packageName=ModuleInfo.TARGET;p.processName=ModuleInfo.TARGET;\n'
+                                        '  '
+                                        'p.isFirstApplication=true;p.classLoader=Harness.class.getClassLoader();p.appInfo=new '
+                                        'android.content.pm.ApplicationInfo();p.appInfo.sourceDir=apk;return '
+                                        'p;}\n'
+                                        ' static void call(ZteShareStatus s,String name,Object... '
+                                        'args){XposedHelpers.callMethod(s,name,args);}\n'
+                                        ' static void policy(ZteShareStatus s,boolean on)throws '
+                                        'Exception{Method '
+                                        'm=HookEntry.class.getDeclaredMethod("applyTimerPolicy",Object.class,boolean.class);m.setAccessible(true);m.invoke(null,s,on);}\n'
+                                        ' public static void main(String[] args)throws Throwable{\n'
+                                        '  HookEntry entry=new HookEntry();LoadPackageParam '
+                                        'p=param(args[0]);p.packageName="com.android.systemui";entry.handleLoadPackage(p);\n'
+                                        '  check(XposedBridge.hooks.isEmpty(),"unrelated package '
+                                        'unchanged");\n'
+                                        '  p=param(args[0]);p.processName+=":other";\n'
+                                        '  '
+                                        'entry.handleLoadPackage(p);check(XposedBridge.hooks.isEmpty(),"unrelated '
+                                        'process unchanged");\n'
+                                        '  '
+                                        'p=param(args[0]);p.isFirstApplication=false;entry.handleLoadPackage(p);check(XposedBridge.hooks.isEmpty(),"secondary '
+                                        'load unchanged");\n'
+                                        '  Path changed=Files.createTempFile("changed-target-",".apk");\n'
+                                        '  try(ZipOutputStream z=new '
+                                        'ZipOutputStream(Files.newOutputStream(changed))){z.putNextEntry(new '
+                                        'ZipEntry("classes.dex"));z.write(new '
+                                        'byte[]{1,2,3});z.closeEntry();}\n'
+                                        '  '
+                                        'reset();entry.handleLoadPackage(param(changed.toString()));check((Integer)value("coreHooks")==0,"mismatched '
+                                        'DEX rejected");\n'
+                                        '  check(!((String)value("failure")).isEmpty(),"mismatch reports '
+                                        'reason");check(XposedBridge.hooks.size()==1,"mismatch only has '
+                                        'attach receiver hook");Files.delete(changed);\n'
+                                        '  '
+                                        'reset();entry.handleLoadPackage(param(args[0]));check((Integer)value("coreHooks")==3,"all '
+                                        'three exact hooks installed");\n'
+                                        '  check(XposedBridge.hooks.size()==5,"no broad Handler '
+                                        'hook");check((Boolean)value("summaryHook"),"settings summary hook '
+                                        'installed");\n'
+                                        '  Method '
+                                        'arm=ZteShareStatus.class.getDeclaredMethod("F",boolean.class),restore=ZteShareStatus.class.getDeclaredMethod("n",android.content.Context.class);\n'
+                                        '  '
+                                        'check(XposedBridge.hooks.containsKey(arm)&&XposedBridge.hooks.containsKey(restore),"both '
+                                        'fresh and restored timers covered");\n'
+                                        '  '
+                                        'check(!XposedBridge.hooks.containsKey(ZteShareStatus.class.getDeclaredMethod("z",android.content.Context.class)),"raw '
+                                        'start timestamp unchanged");\n'
+                                        '  '
+                                        'check(!XposedBridge.hooks.containsKey(ZteShareStatus.class.getDeclaredMethod("q")),"manual '
+                                        'deferred cleanup unchanged");\n'
+                                        '  '
+                                        'check(!XposedBridge.hooks.containsKey(ZteShareStatus.class.getDeclaredMethod("t0",boolean.class)),"transfer '
+                                        'wait flag unchanged");\n'
+                                        '  int[] presets={1,5,10,30,60,0};\n'
+                                        '  for(int minutes:presets){\n'
+                                        '   set("timeoutMinutes",minutes);ZteShareStatus s=new '
+                                        'ZteShareStatus();call(s,"F",true);\n'
+                                        '   check(s.delay==(minutes==0?-1:minutes*60000L),"fresh duration '
+                                        '"+minutes);\n'
+                                        '   check(minutes==0?s.stamp==0:s.stamp>0,"native persistence '
+                                        '"+minutes);\n'
+                                        '   check(s.initializations==(minutes==0?0:1),"native initialization '
+                                        'retained "+minutes);\n'
+                                        '   '
+                                        'XposedHelpers.callMethod(s.w,"run");check(s.closeCalls==(minutes==0?0:1),"expiry '
+                                        'follows selected policy "+minutes);\n'
+                                        '   call(s,"F",false);check(s.stamp==0&&s.delay==-1,"manual off '
+                                        'cancels "+minutes);\n'
+                                        '   long now=10000000L,started=now-30000L;\n'
+                                        '   '
+                                        'check(TimeoutPolicy.remainingMillis(minutes,started,now)==(minutes==0?0:minutes*60000L-30000L),"remaining '
+                                        'arithmetic "+minutes);\n'
+                                        '   if(minutes>0){\n'
+                                        '    '
+                                        'check(TimeoutPolicy.remainingMillis(minutes,now-minutes*60000L,now)==0,"exact '
+                                        'deadline "+minutes);\n'
+                                        '    '
+                                        'check(TimeoutPolicy.remainingMillis(minutes,now+5000L,now)==minutes*60000L,"clock '
+                                        'rollback "+minutes);\n'
+                                        '    s=new '
+                                        'ZteShareStatus();s.stamp=System.currentTimeMillis()-30000L;call(s,"n",s.context);\n'
+                                        '    long '
+                                        'expected=minutes*60000L-30000L;check(s.delay<=expected&&s.delay>=expected-1000L,"restored '
+                                        'remaining "+minutes);\n'
+                                        '   }\n'
+                                        '  }\n'
+                                        '  for(int minutes:new int[]{30,60}){\n'
+                                        '   set("timeoutMinutes",minutes);ZteShareStatus s=new '
+                                        'ZteShareStatus();s.stamp=System.currentTimeMillis()-900000L;call(s,"n",s.context);\n'
+                                        '   long '
+                                        'expected=minutes*60000L-900000L;check(s.delay<=expected&&s.delay>=expected-1000L,"long '
+                                        'timeout survives old 10m boundary "+minutes);\n'
+                                        '  }\n'
+                                        '  set("timeoutMinutes",1);ZteShareStatus expired=new '
+                                        'ZteShareStatus();expired.stamp=System.currentTimeMillis()-65000L;call(expired,"n",expired.context);\n'
+                                        '  check(expired.delay==0&&expired.stamp==0,"expired restore '
+                                        'schedules immediate native close");\n'
+                                        '  set("timeoutMinutes",0);ZteShareStatus always=new '
+                                        'ZteShareStatus();always.stamp=System.currentTimeMillis()-900000L;call(always,"n",always.context);\n'
+                                        '  check(always.delay==-1&&always.stamp==0,"always-on clears old '
+                                        'persisted timer");\n'
+                                        '  ZteShareStatus absent=new '
+                                        'ZteShareStatus();call(absent,"n",absent.context);check(absent.timerArms==0,"no '
+                                        'persisted timer stays unscheduled");\n'
+                                        '  set("enabled",false);set("timeoutMinutes",60);ZteShareStatus '
+                                        'stock=new ZteShareStatus();policy(stock,true);\n'
+                                        '  check(stock.delay==600000L,"disabled module rearms stock '
+                                        '10m");call(stock,"n",stock.context);check(stock.delay>599000L,"disabled '
+                                        'module retains stock restore");\n'
+                                        '  '
+                                        'XposedHelpers.callMethod(stock.w,"run");check(stock.closeCalls==1,"disabled '
+                                        'expiry remains native");\n'
+                                        '  '
+                                        'set("enabled",true);set("timeoutMinutes",5);policy(stock,true);check(stock.delay==300000L,"changing '
+                                        'preset rearms from now");\n'
+                                        '  '
+                                        'set("timeoutMinutes",0);policy(stock,true);check(stock.delay==-1&&stock.stamp==0,"switching '
+                                        'to always-on cancels");\n'
+                                        '  int '
+                                        'arms=stock.timerArms,cancels=stock.timerCancels;policy(stock,false);check(stock.timerArms==arms&&stock.timerCancels==cancels,"settings '
+                                        'never enables a disabled share switch");\n'
+                                        '  for(int bad:new '
+                                        'int[]{-1,2,90,Integer.MAX_VALUE})check(!TimeoutPolicy.valid(bad)&&TimeoutPolicy.normalize(bad)==0,"invalid '
+                                        'preset rejected "+bad);\n'
+                                        '  int '
+                                        'before=XposedBridge.hooks.size();entry.handleLoadPackage(param(args[0]));check(before==XposedBridge.hooks.size(),"duplicate '
+                                        'load unchanged");\n'
+                                        '  reset();XposedBridge.failAt=3;Method '
+                                        'install=HookEntry.class.getDeclaredMethod("installCore",ClassLoader.class);install.setAccessible(true);boolean '
+                                        'failed=false;\n'
+                                        '  '
+                                        'try{install.invoke(null,Harness.class.getClassLoader());}catch(InvocationTargetException '
+                                        'e){failed=true;}\n'
+                                        '  '
+                                        'check(failed&&XposedBridge.hooks.isEmpty()&&(Integer)value("coreHooks")==0,"partial '
+                                        'installation rolled back");\n'
+                                        '  System.out.println("PASS: "+checks+" host-JVM hook and timer '
+                                        'assertions (not an Android device test)");\n'
+                                        ' }\n'
+                                        '}\n',
+ 'android/content/Context.java': 'package android.content;\n'
+                                 'public class Context {\n'
+                                 ' public static final int MODE_PRIVATE=0,RECEIVER_EXPORTED=2;\n'
+                                 ' public String getPackageName(){return "com.zte.cn.zteshare";}\n'
+                                 ' public android.content.ContentResolver getContentResolver(){return '
+                                 'null;}\n'
+                                 ' public android.content.SharedPreferences getSharedPreferences(String '
+                                 'n,int m){return null;}\n'
+                                 ' public android.content.pm.PackageManager getPackageManager(){return '
+                                 'null;}\n'
+                                 ' public Intent registerReceiver(BroadcastReceiver r,IntentFilter f,String '
+                                 'p,android.os.Handler h,int flags){return null;}\n'
+                                 ' public ComponentName startService(Intent i){return null;}\n'
+                                 '}\n',
+ 'android/os/Handler.java': 'package android.os;\n'
+                            'public class Handler {\n'
+                            ' public Handler(){} public Handler(Looper l){}\n'
+                            ' public void removeCallbacks(Runnable r){}\n'
+                            ' public boolean postDelayed(Runnable r,long delay){return true;}\n'
+                            '}\n'}
 
 
 def main():
@@ -234,7 +359,7 @@ def main():
         subprocess.run(["java", "-jar", str(tools / "ecj.jar"), "-source", "1.8", "-target", "1.8",
                         "-encoding", "UTF-8", "-classpath", str(android), "-d", str(classes),
                         *[str(x) for x in root.rglob("*.java")], str(src / "ModuleInfo.java"),
-                        str(src / "HookEntry.java"), str(src / "ModuleConfig.java")], check=True)
+                        str(src / "HookEntry.java"), str(src / "ModuleConfig.java"), str(src / "TimeoutPolicy.java")], check=True)
         subprocess.run(["java", "-cp", str(classes) + ":" + str(android),
                         "de.robv.android.xposed.Harness", str(args.apk.resolve())], check=True)
 
